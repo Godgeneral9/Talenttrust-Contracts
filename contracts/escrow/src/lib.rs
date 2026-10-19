@@ -39,6 +39,7 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    InvalidSplitConfig = 17,
 }
 
 #[contracttype]
@@ -89,6 +90,7 @@ enum DataKey {
     NextId,
     Contract(u64),
     Reputation(Address),
+    Team(u64),
 }
 
 #[contract]
@@ -143,6 +145,49 @@ fn bump_instance(env: &Env) {
 fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amount: i128) {
     if amount > 0 {
         token::Client::new(env, token_addr).transfer(from, to, &amount);
+    }
+}
+
+fn team_split(env: &Env, id: u64) -> Vec<(Address, u32)> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Team(id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Distributes `amount` across fixed basis-point shares. Each share is rounded
+/// down and the remainder is added to the first (lead) payee, so the sum of all
+/// transfers is always exactly `amount`.
+fn distribute(env: &Env, token_addr: &Address, payees: &Vec<(Address, u32)>, amount: i128) {
+    if amount <= 0 || payees.is_empty() {
+        return;
+    }
+    let mut floor_total: i128 = 0;
+    for (_, bps) in payees.iter() {
+        floor_total += amount * bps as i128 / BPS_DENOMINATOR;
+    }
+    let remainder = amount - floor_total;
+    let this = env.current_contract_address();
+    let mut is_lead = true;
+    for (payee, bps) in payees.iter() {
+        let mut share = amount * bps as i128 / BPS_DENOMINATOR;
+        if is_lead {
+            share += remainder;
+            is_lead = false;
+        }
+        transfer(env, token_addr, &this, &payee, share);
+    }
+}
+
+/// Pays `amount` to the configured team split, or to `fallback` when no split
+/// has been configured for the escrow.
+fn pay_out(env: &Env, token_addr: &Address, id: u64, fallback: &Address, amount: i128) {
+    let payees = team_split(env, id);
+    if payees.is_empty() {
+        let this = env.current_contract_address();
+        transfer(env, token_addr, &this, fallback, amount);
+    } else {
+        distribute(env, token_addr, &payees, amount);
     }
 }
 
@@ -236,6 +281,52 @@ impl Escrow {
         Ok(id)
     }
 
+    /// Freelancer configures fixed basis-point shares for a team of up to five
+    /// payees. The shares must be non-zero and sum to exactly 10,000 bps.
+    pub fn set_team_split(
+        env: Env,
+        id: u64,
+        payees: Vec<(Address, u32)>,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        c.freelancer.require_auth();
+        if c.status != ContractStatus::Created || c.funded_amount != 0 {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let len = payees.len();
+        if len == 0 || len > 5 {
+            return Err(EscrowError::InvalidSplitConfig);
+        }
+        let this = env.current_contract_address();
+        let mut total: u32 = 0;
+        for i in 0..len {
+            let (payee, bps) = payees.get(i).unwrap();
+            if bps == 0 || payee == c.client || payee == this {
+                return Err(EscrowError::InvalidSplitConfig);
+            }
+            for j in (i + 1)..len {
+                if payee == payees.get(j).unwrap().0 {
+                    return Err(EscrowError::InvalidSplitConfig);
+                }
+            }
+            total = total
+                .checked_add(bps)
+                .ok_or(EscrowError::InvalidSplitConfig)?;
+        }
+        if total as i128 != BPS_DENOMINATOR {
+            return Err(EscrowError::InvalidSplitConfig);
+        }
+        let key = DataKey::Team(id);
+        env.storage().persistent().set(&key, &payees);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("team"), id), payees.len());
+        Ok(())
+    }
+
     /// Client deposits `amount` of the escrow token into the contract.
     pub fn deposit_funds(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
@@ -288,13 +379,7 @@ impl Escrow {
         if c.funded_amount - c.released_amount < m.amount {
             return Err(EscrowError::InsufficientFunds);
         }
-        transfer(
-            &env,
-            &c.token,
-            &env.current_contract_address(),
-            &c.freelancer,
-            m.amount,
-        );
+        pay_out(&env, &c.token, id, &c.freelancer, m.amount);
         m.released = true;
         c.released_amount += m.amount;
         c.milestones.set(index, m.clone());
@@ -339,7 +424,7 @@ impl Escrow {
         let to_freelancer = held * freelancer_bps as i128 / BPS_DENOMINATOR;
         let to_client = held - to_freelancer;
         let this = env.current_contract_address();
-        transfer(&env, &c.token, &this, &c.freelancer, to_freelancer);
+        pay_out(&env, &c.token, id, &c.freelancer, to_freelancer);
         transfer(&env, &c.token, &this, &c.client, to_client);
         c.released_amount += to_freelancer;
         c.funded_amount = c.released_amount;
@@ -418,6 +503,11 @@ impl Escrow {
             .persistent()
             .get(&DataKey::Reputation(freelancer))
             .unwrap_or_default()
+    }
+
+    /// Returns the configured team split, or an empty vector if none is set.
+    pub fn get_team_split(env: Env, id: u64) -> Vec<(Address, u32)> {
+        team_split(&env, id)
     }
 }
 
