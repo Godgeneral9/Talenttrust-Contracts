@@ -33,7 +33,17 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `cancel_contract(id)` | client | Refund unreleased funds and close |
 | `issue_reputation(id, rating)` | client | Rate a completed job (1-5), once |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
-| `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_admin()`, `version()` | - | Reads |
+| `get_contract(id)` | - | Full escrow record, including all milestones |
+| `get_milestone(id, index)` | - | Single milestone; `MilestoneNotFound` when out of range |
+| `get_escrow_summary(id)` | - | Status and derived balances for one escrow |
+| `get_escrow_summaries(ids)` | - | Up to 25 summaries; unknown ids skipped, larger batches return `InvalidAmount` |
+| `contract_count()`, `get_reputation(addr)`, `get_admin()`, `version()` | - | Reads |
+
+`EscrowSummary` reports `held` (`funded_amount - released_amount`),
+`remaining_to_fund` (`total_amount - funded_amount`), milestone counts, the first
+unreleased index, and whether the held balance covers that milestone. Read calls
+never write storage, extend TTLs, or emit events; reads return `ContractNotFound`
+for an unknown escrow id.
 
 Status flow: `Created -> Funded -> Completed`, with `Disputed -> Resolved` and `Cancelled` side exits.
 
